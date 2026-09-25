@@ -1,6 +1,5 @@
 const http = require("http");
 const https = require("https");
-const { URL } = require("url");
 const fs = require("fs");
 const path = require("path");
 
@@ -10,7 +9,6 @@ const MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 
 const REQUEST_TIMEOUT = 60000;
 const MAX_BODY_SIZE = 100000;
-const MAX_RESULTS = 5;
 
 function request(url, options = {}, body = null) {
   return new Promise((resolve, reject) => {
@@ -46,90 +44,6 @@ function request(url, options = {}, body = null) {
 
     req.end();
   });
-}
-
-function decodeHtml(text) {
-  return String(text || "")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#x27;|&#39;/gi, "'")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">");
-}
-
-function cleanText(text) {
-  return decodeHtml(
-    String(text || "")
-      .replace(/<[^>]*>/g, "")
-      .replace(/\s+/g, " ")
-      .trim()
-  );
-}
-
-async function webSearch(query) {
-  const url = new URL("https://html.duckduckgo.com/html/");
-  url.searchParams.set("q", query);
-
-  let response;
-
-  try {
-    response = await request(url.toString(), {
-      method: "GET",
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; OneAgentWeb/1.0)",
-        Accept: "text/html"
-      }
-    });
-  } catch (error) {
-    console.error("Web search error:", error.message);
-    return [];
-  }
-
-  if (response.status < 200 || response.status >= 300) {
-    return [];
-  }
-
-  const results = [];
-
-  const regex =
-    /<a[^>]*class=["'][^"']*result__a[^"']*["'][^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
-
-  let match;
-
-  while ((match = regex.exec(response.body)) !== null) {
-    if (results.length >= MAX_RESULTS) {
-      break;
-    }
-
-    const title = cleanText(match[2]);
-    let link = match[1];
-
-    try {
-      const parsed = new URL(
-        link,
-        "https://html.duckduckgo.com"
-      );
-
-      const realUrl = parsed.searchParams.get("uddg");
-
-      if (realUrl) {
-        link = decodeURIComponent(realUrl);
-      }
-    } catch {
-      continue;
-    }
-
-    if (!title || !link) {
-      continue;
-    }
-
-    results.push({
-      title,
-      url: link
-    });
-  }
-
-  return results;
 }
 
 function sendJson(res, status, data) {
@@ -195,16 +109,88 @@ function extractInteractionText(data) {
     .trim();
 }
 
-async function runGemini(prompt) {
+function extractSources(data) {
+  const sources = [];
+  const seen = new Set();
+
+  const steps = Array.isArray(data?.steps)
+    ? data.steps
+    : [];
+
+  for (const step of steps) {
+    if (step?.type !== "model_output") {
+      continue;
+    }
+
+    const content = Array.isArray(step.content)
+      ? step.content
+      : [];
+
+    for (const item of content) {
+      if (!Array.isArray(item?.annotations)) {
+        continue;
+      }
+
+      for (const annotation of item.annotations) {
+        if (
+          annotation?.type !== "url_citation"
+        ) {
+          continue;
+        }
+
+        const url =
+          annotation.url ||
+          annotation.uri;
+
+        const title =
+          annotation.title ||
+          url;
+
+        if (!url || seen.has(url)) {
+          continue;
+        }
+
+        seen.add(url);
+
+        sources.push({
+          title,
+          url
+        });
+      }
+    }
+  }
+
+  return sources;
+}
+
+async function runGemini(task) {
   if (!API_KEY) {
     throw new Error(
-      "متغير GEMINI_API_KEY غير مضبوط في إعدادات Render."
+      "متغير GEMINI_API_KEY غير مضبوط في Render."
     );
   }
 
+  const input = [
+    "أنت وكيل بحث ويب بسيط.",
+    "نفّذ مهمة المستخدم بدقة.",
+    "استخدم Google Search للحصول على المعلومات الحديثة عند الحاجة.",
+    "إذا استخدمت البحث، اعتمد على المصادر التي أعادها البحث.",
+    "لا تخترع معلومات أو مصادر.",
+    "أجب بالعربية الواضحة ما لم يطلب المستخدم لغة أخرى.",
+    "إذا كانت المعلومات غير كافية، قل ذلك بوضوح.",
+    "",
+    "مهمة المستخدم:",
+    task
+  ].join("\n");
+
   const requestBody = JSON.stringify({
     model: MODEL,
-    input: prompt,
+    input,
+    tools: [
+      {
+        type: "google_search"
+      }
+    ],
     store: false
   });
 
@@ -265,10 +251,14 @@ async function runGemini(prompt) {
     );
   }
 
+  const sources =
+    extractSources(data);
+
   const usage = data.usage || {};
 
   return {
     result,
+    sources,
     usage: {
       input_tokens:
         Number(
@@ -291,41 +281,12 @@ async function runGemini(prompt) {
 async function runTask(task) {
   const started = Date.now();
 
-  const sources =
-    await webSearch(task);
-
-  const sourceText =
-    sources.length > 0
-      ? sources
-          .map(
-            (source, index) =>
-              `[${index + 1}] ${source.title}\n${source.url}`
-          )
-          .join("\n\n")
-      : "لم يتم العثور على نتائج ويب.";
-
-  const prompt = [
-    "أنت وكيل بحث ويب بسيط.",
-    "نفّذ مهمة المستخدم بدقة.",
-    "استخدم نتائج البحث المرفقة كمصادر مساعدة.",
-    "لا تخترع معلومات أو مصادر.",
-    "أجب بالعربية الواضحة ما لم يطلب المستخدم لغة أخرى.",
-    "إذا اعتمدت على نتيجة بحث، أشر إليها برقمها مثل [1] أو [2].",
-    "إذا كانت المعلومات غير كافية، قل ذلك بوضوح.",
-    "",
-    "مهمة المستخدم:",
-    task,
-    "",
-    "نتائج البحث:",
-    sourceText
-  ].join("\n");
-
   const gemini =
-    await runGemini(prompt);
+    await runGemini(task);
 
   return {
     result: gemini.result,
-    sources,
+    sources: gemini.sources,
     model: MODEL,
     usage: gemini.usage,
     elapsed_ms:
@@ -384,8 +345,10 @@ const server = http.createServer(
     try {
       if (
         req.method === "GET" &&
-        (req.url === "/" ||
-          req.url === "/index.html")
+        (
+          req.url === "/" ||
+          req.url === "/index.html"
+        )
       ) {
         sendPage(res);
         return;
